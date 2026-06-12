@@ -82,6 +82,16 @@ Run the bundled suite headlessly:
 GODOT=/path/to/Godot ./tests/run_tests.sh
 ```
 
+## Try it live (smoke test)
+Send one real event and confirm PostHog accepted it — no game required:
+```bash
+POSTHOG_API_KEY=phc_xxx GODOT=/path/to/Godot ./tools/smoke.sh
+# EU project? add: POSTHOG_HOST=https://eu.i.posthog.com
+```
+Grab the key from **Project Settings → Project API Key** (`phc_...`). A green run prints
+`✓ PostHog accepted the batch`; the `godot_smoke_test` event shows up in your Activity feed
+within a few seconds.
+
 ## API reference
 | Method | Purpose |
 |---|---|
