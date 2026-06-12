@@ -20,6 +20,10 @@ const LIB_NAME := "posthog-godot"
 const LIB_VERSION := "0.1.0"
 const DISTINCT_ID_FILE := "user://posthog.cfg"
 const CAPTURED_RING_MAX := 1000
+const JSON_HEADERS := ["Content-Type: application/json"]
+## Cap on simultaneously in-flight HTTP requests, so a slow network + the flush timer
+## can't pile up HTTPRequest nodes. Excess events stay queued for the next flush.
+const MAX_INFLIGHT := 4
 
 ## Emitted for EVERY captured event (live, no-key, or test mode), after enqueue.
 ## Connect from a QA overlay or a test to observe the stream without a network round-trip.
@@ -41,7 +45,7 @@ var test_mode := false
 
 # --- State ---
 var distinct_id := ""
-## Ring buffer of recently captured events: [{event, properties, timestamp}]. For QA + asserts.
+## Ring buffer of recently captured events: [{event, distinct_id, properties, timestamp, uuid}]. For QA + asserts.
 var captured_events: Array[Dictionary] = []
 
 var _opted_out := false
@@ -49,10 +53,14 @@ var _queue: Array[Dictionary] = []
 var _flush_timer: Timer
 var _feature_flags: Dictionary = {}      # key -> bool|String(variant)
 var _flags_loaded := false
+var _flags_inflight := false             # guard against concurrent flag reloads
+var _inflight := 0                       # number of HTTP requests currently outstanding
 var _super_props: Dictionary = {}        # merged into every event's properties
+var _rng := RandomNumberGenerator.new()  # one RNG, reused for per-event uuids
 
 
 func _ready() -> void:
+	_rng.randomize()
 	_load_config()
 	distinct_id = _load_or_create_distinct_id()
 	_super_props = _default_super_properties()
@@ -80,7 +88,8 @@ func capture(event: String, properties: Dictionary = {}) -> void:
 		push_warning("[PostHog] capture() called with empty event name; ignored.")
 		return
 
-	var props := _super_props.duplicate(true)
+	# Shallow copy is enough: super-properties are flat primitives.
+	var props := _super_props.duplicate()
 	for k in properties:
 		props[k] = properties[k]
 
@@ -89,6 +98,9 @@ func capture(event: String, properties: Dictionary = {}) -> void:
 		"distinct_id": distinct_id,
 		"properties": props,
 		"timestamp": _now_iso8601(),
+		# Stable per-event id so an at-least-once retry is deduped server-side
+		# (PostHog dedupes on uuid) instead of double-counting.
+		"uuid": _uuid_v4(),
 	}
 
 	# Local mirror first — tests/QA see every event regardless of network/key.
@@ -139,6 +151,10 @@ func opt_in() -> void:
 func flush() -> void:
 	if not _is_active() or _queue.is_empty():
 		return
+	# At the concurrency cap: leave events queued for the next flush rather than
+	# spawning more in-flight requests.
+	if _inflight >= MAX_INFLIGHT:
+		return
 	var batch := _queue
 	_queue = []
 	_send_batch(batch)
@@ -162,7 +178,7 @@ func get_feature_flag(key: String, default = false):
 
 
 func feature_flags() -> Dictionary:
-	return _feature_flags.duplicate(true)
+	return _feature_flags.duplicate()
 
 
 func feature_flags_ready() -> bool:
@@ -170,18 +186,17 @@ func feature_flags_ready() -> bool:
 
 
 ## Fetch feature flags for the current distinct_id. Emits `feature_flags_loaded`.
+## No-ops if a flags request is already in flight.
 func reload_feature_flags() -> void:
-	if not _is_active():
+	if not _is_active() or _flags_inflight:
 		return
-	var req := _new_request()
-	req.request_completed.connect(
-		func(_result, code, _headers, body): _on_flags_response(req, code, body)
+	_flags_inflight = true
+	_post_json("%s/flags/?v=2" % _base(), {"api_key": api_key, "distinct_id": distinct_id},
+		func(result, code, body):
+			_flags_inflight = false
+			if result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300:
+				_apply_flags(body)
 	)
-	var url := "%s/flags/?v=2" % _base()
-	var data := JSON.stringify({"api_key": api_key, "distinct_id": distinct_id})
-	var err := req.request(url, ["Content-Type: application/json"], HTTPClient.METHOD_POST, data)
-	if err != OK:
-		req.queue_free()
 
 
 # --- Test / QA helpers ---------------------------------------------------------------
@@ -242,44 +257,58 @@ func _record(payload: Dictionary) -> void:
 
 
 func _send_batch(batch: Array) -> void:
-	var req := _new_request()
-	req.request_completed.connect(
-		func(result, code, _headers, body):
-			var ok: bool = result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300
-			if not ok:
-				push_warning("[PostHog] batch send failed: result=%d http=%d body=%s" % [result, code, body.get_string_from_utf8()])
-				# Re-queue on failure so events aren't lost (best-effort, bounded by max_batch growth).
-				for e in batch:
-					if _queue.size() < max_batch * 4:
-						_queue.append(e)
-			flush_completed.emit(ok, batch.size())
-			req.queue_free()
-	)
-	var body := JSON.stringify({
+	_post_json("%s/batch/" % _base(), {
 		"api_key": api_key,
 		"historical_migration": false,
 		"batch": batch,
-	})
-	var err := req.request("%s/batch/" % _base(), ["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
+	}, func(result, code, body):
+		var ok: bool = result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300
+		if not ok:
+			push_warning("[PostHog] batch send failed: result=%d http=%d body=%s" % [result, code, body.get_string_from_utf8()])
+			# Re-queue on failure so events aren't lost (bounded; each event carries a uuid,
+			# so a retry that PostHog already received is deduped rather than double-counted).
+			for e in batch:
+				if _queue.size() < max_batch * 4:
+					_queue.append(e)
+		flush_completed.emit(ok, batch.size())
+	)
+
+
+## POST a JSON body and invoke `on_done(result: int, http_code: int, body: PackedByteArray)`
+## exactly once. Owns the HTTPRequest lifecycle and the in-flight counter so callers don't
+## repeat the node + signal + cleanup ceremony.
+func _post_json(url: String, body: Dictionary, on_done: Callable) -> void:
+	var req := _new_request()
+	_inflight += 1
+	req.request_completed.connect(
+		func(result, code, _headers, response):
+			_inflight = max(0, _inflight - 1)
+			req.queue_free()
+			on_done.call(result, code, response)
+	)
+	var err := req.request(url, JSON_HEADERS, HTTPClient.METHOD_POST, JSON.stringify(body))
 	if err != OK:
+		_inflight = max(0, _inflight - 1)
 		req.queue_free()
-		flush_completed.emit(false, batch.size())
+		# Surface as a transport failure so callers run their failure path uniformly.
+		on_done.call(HTTPRequest.RESULT_CANT_CONNECT, 0, PackedByteArray())
 
 
-func _on_flags_response(req: HTTPRequest, code: int, body: PackedByteArray) -> void:
-	req.queue_free()
-	if code < 200 or code >= 300:
-		return
+func _apply_flags(body: PackedByteArray) -> void:
 	var parsed = JSON.parse_string(body.get_string_from_utf8())
 	if typeof(parsed) != TYPE_DICTIONARY:
 		return
 	var flags: Dictionary = {}
-	# /flags v2 shape: {"flags": {key: {"enabled": bool, "variant": String|null}}}
+	# /flags v2 shape: {"flags": {key: {"enabled": bool, "variant": String|null}}}.
+	# A multivariate's variant takes precedence; otherwise fall back to the boolean enabled.
 	if parsed.has("flags") and parsed["flags"] is Dictionary:
 		for key in parsed["flags"]:
 			var f = parsed["flags"][key]
 			if f is Dictionary:
-				flags[key] = f.get("variant") if f.get("variant") != null else f.get("enabled", false)
+				if f.get("variant") != null:
+					flags[key] = f["variant"]
+				else:
+					flags[key] = f.get("enabled", false)
 			else:
 				flags[key] = f
 	# /decide legacy shape: {"featureFlags": {key: bool|String}}
@@ -287,7 +316,7 @@ func _on_flags_response(req: HTTPRequest, code: int, body: PackedByteArray) -> v
 		flags = parsed["featureFlags"]
 	_feature_flags = flags
 	_flags_loaded = true
-	feature_flags_loaded.emit(_feature_flags.duplicate(true))
+	feature_flags_loaded.emit(_feature_flags.duplicate())
 
 
 func _new_request() -> HTTPRequest:
@@ -348,12 +377,10 @@ func _persist_distinct_id(id: String) -> void:
 
 
 func _uuid_v4() -> String:
-	# RFC-4122-ish v4 from the engine RNG. Good enough for an anonymous analytics id.
-	var rng := RandomNumberGenerator.new()
-	rng.randomize()
+	# RFC-4122-ish v4 from the shared engine RNG. Good enough for anon ids + event uuids.
 	var b := PackedByteArray()
 	for i in 16:
-		b.append(rng.randi() % 256)
+		b.append(_rng.randi() % 256)
 	b[6] = (b[6] & 0x0f) | 0x40   # version 4
 	b[8] = (b[8] & 0x3f) | 0x80   # variant 10
 	var hex := b.hex_encode()
@@ -361,7 +388,9 @@ func _uuid_v4() -> String:
 
 
 func _notification(what: int) -> void:
-	# Best-effort flush when the app is backgrounded or closing.
+	# Best-effort flush when the app is backgrounded or closing. NOTE: the send is async, so
+	# events still in flight when the process exits can be lost — a durable on-disk queue
+	# (see README roadmap) is the real fix. Backgrounding (mobile) is the more reliable hook.
 	if what == NOTIFICATION_WM_CLOSE_REQUEST or what == NOTIFICATION_APPLICATION_PAUSED:
 		if capture_app_lifecycle:
 			capture("application_backgrounded")

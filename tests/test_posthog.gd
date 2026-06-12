@@ -27,10 +27,21 @@ func run() -> void:
 	truthy(seen["props"].get("$os"), "$os super-property present")
 	PostHog.event_captured.disconnect(cb)
 
+	# --- every event carries a unique uuid (for idempotent server-side retry dedup) ---
+	PostHog.clear_captured()
+	PostHog.capture("evt_a")
+	PostHog.capture("evt_b")
+	var uuid_a: String = PostHog.last_captured("evt_a").get("uuid", "")
+	var uuid_b: String = PostHog.last_captured("evt_b").get("uuid", "")
+	truthy(uuid_a, "event has a uuid")
+	ne(uuid_a, uuid_b, "each event gets a distinct uuid")
+
 	# --- register() adds a sticky super-property to subsequent events ---
 	PostHog.register({"build": "qa-42"})
 	PostHog.capture("thing_happened")
 	eq(PostHog.last_captured("thing_happened")["properties"].get("build"), "qa-42", "registered super-prop sticks")
+	# Sticky props must not leak backwards into already-captured events (shallow-copy safety).
+	check(not PostHog.last_captured("evt_a")["properties"].has("build"), "super-prop change doesn't mutate past events")
 	PostHog.unregister("build")
 
 	# --- feature flags can be seeded deterministically for flag-gated code ---
