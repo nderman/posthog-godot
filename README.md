@@ -1,5 +1,7 @@
 # posthog-godot
 
+<img src="icon.png" width="96" align="right" alt="posthog-godot icon">
+
 [![tests](https://github.com/nderman/posthog-godot/actions/workflows/tests.yml/badge.svg)](https://github.com/nderman/posthog-godot/actions/workflows/tests.yml)
 
 A small, dependency-free **[PostHog](https://posthog.com) SDK for Godot 4** — product
