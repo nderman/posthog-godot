@@ -1,0 +1,13 @@
+# Godot 4
+.godot/
+.import/
+export.cfg
+export_presets.cfg
+
+# Godot-imported asset cache / temp
+*.import
+.DS_Store
+
+# Local runtime artifacts
+user://
+*.log
