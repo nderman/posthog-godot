@@ -244,9 +244,10 @@ func _record(payload: Dictionary) -> void:
 func _send_batch(batch: Array) -> void:
 	var req := _new_request()
 	req.request_completed.connect(
-		func(result, code, _headers, _body):
+		func(result, code, _headers, body):
 			var ok: bool = result == HTTPRequest.RESULT_SUCCESS and code >= 200 and code < 300
 			if not ok:
+				push_warning("[PostHog] batch send failed: result=%d http=%d body=%s" % [result, code, body.get_string_from_utf8()])
 				# Re-queue on failure so events aren't lost (best-effort, bounded by max_batch growth).
 				for e in batch:
 					if _queue.size() < max_batch * 4:
